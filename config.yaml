@@ -1,0 +1,26 @@
+seed: 42
+
+mae_ckpt: ../mae_pretrain_vit_base.pth
+
+data:
+  out_size: 224
+  k_slices: 3
+  val_frac: 0.2
+  lesion_sampling: "auto" # or "auto" to estimate from train set
+  img_key: img
+  mask_key: mask
+  normalize: true
+
+train:
+  epochs: 30
+  batch_size: 16
+  num_workers: 4
+  amp: true
+
+optim:
+  lr: 0.001
+  wd: 0.05
+
+loss:
+  bce_weight: 0.5
+  dice_weight: 0.5
