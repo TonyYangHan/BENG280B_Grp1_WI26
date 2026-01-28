@@ -84,11 +84,16 @@ class NpzSliceDataset(Dataset):
         self.mask_key = mask_key
         self.normalize = normalize
 
-        # index: (case_i, z)
+        # index: (case_i, z) for slices that contain lesion only
         self.index: List[Tuple[int, int]] = []
         for ci, c in enumerate(self.cases):
-            for z in range(c.num_slices):
+            if not c.lesion_slices:
+                continue
+            for z in c.lesion_slices:
                 self.index.append((ci, z))
+
+        if not self.index:
+            raise ValueError("No lesion-containing slices found in provided cases.")
 
     def __len__(self):
         return len(self.index)

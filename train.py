@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 import timm
 
 from data import build_case_index, split_cases, NpzSliceDataset
-from loss import BCEDiceLoss, dice_score_from_logits
+from loss import BCEDiceLoss, FocalDiceLoss, dice_score_from_logits
 from utils import (
     set_seed, AverageMeter, save_checkpoint,
     load_mae_vitb16_encoder_weights,
@@ -169,8 +169,10 @@ def main():
     lr = float(deep_get(cfg, "optim.lr", 1e-3))
     wd = float(deep_get(cfg, "optim.wd", 0.05))
 
-    bce_w = float(deep_get(cfg, "loss.bce_weight", 0.5))
-    dice_w = float(deep_get(cfg, "loss.dice_weight", 0.5))
+    # Focal-Dice defaults
+    focal_gamma = float(deep_get(cfg, "loss.focal_gamma", 1.0))
+    alpha_pos = float(deep_get(cfg, "loss.alpha_pos", 0.75))
+    alpha_neg = float(deep_get(cfg, "loss.alpha_neg", 0.25))
 
     set_seed(seed)
 
@@ -251,7 +253,7 @@ def main():
     # -----------------
     # Loss / opt
     # -----------------
-    criterion = BCEDiceLoss(bce_weight=bce_w, dice_weight=dice_w).to(device)
+    criterion = FocalDiceLoss(gamma=focal_gamma, alpha_pos=alpha_pos, alpha_neg=alpha_neg).to(device)
     optimizer = torch.optim.AdamW(decoder.parameters(), lr=lr, weight_decay=wd)
 
     # -----------------
