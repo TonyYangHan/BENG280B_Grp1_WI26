@@ -1,4 +1,4 @@
-import os, random
+import os, random, matplotlib.pyplot as plt
 from typing import Dict, Any, Tuple
 
 import numpy as np
@@ -135,3 +135,113 @@ def load_mae_vitb16_encoder_weights(vit_model, mae_ckpt_path: str, device: str =
     }
     epoch = int(ckpt.get("epoch", -1)) if isinstance(ckpt, dict) else -1
     return epoch, extra
+
+
+def compute_roc_auc(probs: np.ndarray, labels: np.ndarray):
+    """
+    probs: float array [N] in [0,1]
+    labels: uint8/bool/int array [N] in {0,1}
+    Returns: fpr [M], tpr [M], auc float
+    """
+    probs = probs.astype(np.float64, copy=False)
+    labels = labels.astype(np.int32, copy=False)
+
+    P = int(labels.sum())
+    N = int(labels.shape[0] - P)
+    if P == 0 or N == 0:
+        return np.array([0.0, 1.0]), np.array([0.0, 1.0]), float("nan")
+
+    order = np.argsort(-probs)  # descending
+    y = labels[order]
+
+    tp = np.cumsum(y)
+    fp = np.cumsum(1 - y)
+
+    tpr = tp / P
+    fpr = fp / N
+
+    # add (0,0) start
+    tpr = np.concatenate([[0.0], tpr])
+    fpr = np.concatenate([[0.0], fpr])
+
+    # numpy 2.0 renamed trapz -> trapezoid; keep backward compatibility
+    trapz_fn = getattr(np, "trapz", None) or getattr(np, "trapezoid", None)
+    auc = float(trapz_fn(tpr, fpr))
+    return fpr, tpr, auc
+
+
+def sample_pixels_for_roc(
+    probs: torch.Tensor,     # [B,1,H,W] on GPU
+    targets: torch.Tensor,   # [B,1,H,W] on GPU
+    sample_pixels_per_slice: int = 2048,
+    pos_pixels_per_slice: int = 256,
+):
+    """
+    Stratified sampling per slice:
+      - try to sample some positives (if any)
+      - fill the rest with negatives
+    Returns two CPU numpy arrays (p, y) concatenated across batch.
+    """
+    probs = probs.detach()
+    targets = targets.detach()
+
+    B, _, H, W = probs.shape
+    total = H * W
+    sp = int(sample_pixels_per_slice)
+    spp = int(pos_pixels_per_slice)
+    spp = max(0, min(sp, spp))
+    spn = sp - spp
+
+    ps = []
+    ys = []
+
+    for b in range(B):
+        p = probs[b, 0].reshape(-1)
+        y = targets[b, 0].reshape(-1)
+
+        pos_idx = torch.where(y > 0.5)[0]
+        neg_idx = torch.where(y <= 0.5)[0]
+
+        # sample positives
+        if pos_idx.numel() > 0 and spp > 0:
+            kpos = min(spp, int(pos_idx.numel()))
+            sel_pos = pos_idx[torch.randint(0, pos_idx.numel(), (kpos,), device=pos_idx.device)]
+        else:
+            sel_pos = None
+            kpos = 0
+
+        # sample negatives
+        if spn > 0 and neg_idx.numel() > 0:
+            kneg = min(spn + (spp - kpos), int(neg_idx.numel()))
+            sel_neg = neg_idx[torch.randint(0, neg_idx.numel(), (kneg,), device=neg_idx.device)]
+        else:
+            sel_neg = None
+            kneg = 0
+
+        if sel_pos is not None and sel_neg is not None:
+            sel = torch.cat([sel_pos, sel_neg], dim=0)
+        elif sel_pos is not None:
+            sel = sel_pos
+        elif sel_neg is not None:
+            sel = sel_neg
+        else:
+            # extremely unlikely
+            sel = torch.randint(0, total, (min(sp, total),), device=p.device)
+
+        ps.append(p[sel].float().cpu().numpy())
+        ys.append(y[sel].float().cpu().numpy())
+
+    return np.concatenate(ps, axis=0), np.concatenate(ys, axis=0)
+
+def save_roc_plot(fpr, tpr, auc, out_dir: str, epoch: int):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_path = out_dir / f"roc_val_ep{epoch:03d}.png"
+    plt.figure(figsize=(5, 5))
+    plt.plot(fpr, tpr)
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"Val ROC (AUROC={auc:.4f})")
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=200)
+    plt.close()

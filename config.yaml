@@ -4,17 +4,38 @@ mae_ckpt: ../mae_pretrain_vit_base.pth
 
 data:
   out_size: 224
-  k_slices: 3
   val_frac: 0.2
-  lesion_sampling: "auto" # or "auto" to estimate from train set
-  img_key: img
   mask_key: mask
+
+  # Input mode:
+  # - modalities: channels are [DWI(z), ADC(z), FLAIR(z)]
+  # - zstack: channels are [z-1, z, z+1] from img_key volume
+  channel_mode: modalities
+  modality_keys: [dwi, adc, flair]
+
+  # Only used when channel_mode == zstack
+  img_key: img
+  k_slices: 3
+
   normalize: true
+
+  # Sampling: default training uses ALL lesion slices + some empty-mask slices
+  # empty_slice_prob = probability that a returned sample is an empty-mask z-slice
+  empty_slice_prob: 0.1
+  # For validation, default keep lesion-only slices
+  val_empty_slice_prob: 0.0
+
+  crop:
+    enabled: false
+    # crop size in NATIVE resolution (e.g. 112x112 -> crop 96x96), then resize to out_size
+    size_native: 96
+    # jitter fraction of crop size (0.15 -> +/- 14 px if crop=96)
+    jitter: 0.15
 
 train:
   epochs: 30
   batch_size: 16
-  num_workers: 4
+  num_workers: 8
   amp: true
 
 optim:
@@ -22,5 +43,21 @@ optim:
   wd: 0.05
 
 loss:
-  bce_weight: 0.5
-  dice_weight: 0.5
+  focal_gamma: 1.0
+  alpha_pos: 0.75
+  alpha_neg: 0.25
+  focal_w: 0.5
+  dice_w: 0.5
+
+metrics:
+  dice_thr: 0.5
+  ignore_empty_in_dice: true
+
+  roc:
+    enabled: true
+    # pixel-level ROC/AUC is computed on a stratified random sample of pixels per slice
+    sample_pixels_per_slice: 2048
+    pos_pixels_per_slice: 256
+    # cap number of slices used for ROC sampling (keeps runtime predictable)
+    max_slices: 4096
+    save_plot: true

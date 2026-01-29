@@ -1,79 +1,23 @@
-import os
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
 import timm
 
 from data import build_case_index, split_cases, NpzSliceDataset
-from loss import BCEDiceLoss, FocalDiceLoss, dice_score_from_logits
+from loss import FocalDiceLoss, dice_score_from_logits, dice_score_ignore_empty
 from utils import (
     set_seed, AverageMeter, save_checkpoint,
     load_mae_vitb16_encoder_weights,
-    load_yaml_config, deep_get
+    load_yaml_config, deep_get, compute_roc_auc, sample_pixels_for_roc,
+    save_roc_plot
 )
+from model import FrozenMAEEncoder, SimpleUpsampleDecoder
 
 
-class FrozenMAEEncoder(nn.Module):
-    def __init__(self, vit):
-        super().__init__()
-        self.vit = vit
-
-    @torch.no_grad()
-    def forward(self, x):
-        tokens = self.vit.forward_features(x)  # [B, N+1, C]
-        if tokens.ndim != 3:
-            raise RuntimeError(f"Expected token tensor [B,N,C], got {tokens.shape}.")
-        patch = tokens[:, 1:, :]
-        B, N, C = patch.shape
-        h = w = int(N ** 0.5)
-        if h * w != N:
-            raise RuntimeError(f"Patch tokens N={N} is not a square; check input size/patch size.")
-        feat = patch.transpose(1, 2).reshape(B, C, h, w)
-        return feat
-
-
-class SimpleUpsampleDecoder(nn.Module):
-    def __init__(self, in_ch: int = 768, out_size: int = 224, patch: int = 16, mid_ch: int = 256):
-        super().__init__()
-        assert out_size % patch == 0, "out_size must be divisible by patch size."
-
-        def gn(c):
-            g = 32
-            while c % g != 0 and g > 1:
-                g //= 2
-            return nn.GroupNorm(g, c)
-
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_ch, mid_ch, 3, padding=1, bias=False),
-            gn(mid_ch),
-            nn.GELU(),
-        )
-
-        steps = int(round(torch.log2(torch.tensor(patch)).item()))  # patch=16 -> 4
-        self.blocks = nn.ModuleList()
-        for _ in range(steps):
-            self.blocks.append(nn.Sequential(
-                nn.Conv2d(mid_ch, mid_ch, 3, padding=1, bias=False),
-                gn(mid_ch),
-                nn.GELU(),
-            ))
-
-        self.head = nn.Conv2d(mid_ch, 1, kernel_size=1)
-
-    def forward(self, feat):
-        x = self.proj(feat)
-        for blk in self.blocks:
-            x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-            x = blk(x)
-        return self.head(x)
-
-
-def train_one_epoch(encoder, decoder, loader, criterion, optimizer, device, amp: bool):
+def train_one_epoch(encoder, decoder, loader, criterion, optimizer, device, amp: bool, dice_thr: float, ignore_empty_dice: bool):
     encoder.eval()
     decoder.train()
 
@@ -86,7 +30,7 @@ def train_one_epoch(encoder, decoder, loader, criterion, optimizer, device, amp:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        with torch.amp.autocast("cuda",enabled=amp):
+        with torch.amp.autocast("cuda", enabled=amp):
             feat = encoder(x)
             logits = decoder(feat)
             loss = criterion(logits, y)
@@ -97,7 +41,10 @@ def train_one_epoch(encoder, decoder, loader, criterion, optimizer, device, amp:
         scaler.update()
 
         with torch.no_grad():
-            d = dice_score_from_logits(logits, y).item()
+            if ignore_empty_dice:
+                d = dice_score_ignore_empty(logits, y, thr=dice_thr)
+            else:
+                d = float(dice_score_from_logits(logits, y, thr=dice_thr).item())
 
         loss_meter.update(loss.item(), n=x.size(0))
         dice_meter.update(d, n=x.size(0))
@@ -106,12 +53,29 @@ def train_one_epoch(encoder, decoder, loader, criterion, optimizer, device, amp:
 
 
 @torch.no_grad()
-def validate(encoder, decoder, loader, criterion, device):
+def validate(
+    encoder, decoder, loader, criterion, device,
+    dice_thr: float,
+    ignore_empty_dice: bool,
+    roc_cfg: dict,
+    out_dir: Path,
+    epoch: int,
+):
     encoder.eval()
     decoder.eval()
 
     loss_meter = AverageMeter()
     dice_meter = AverageMeter()
+
+    roc_enabled = bool(roc_cfg.get("enabled", False))
+    sp = int(roc_cfg.get("sample_pixels_per_slice", 2048))
+    spp = int(roc_cfg.get("pos_pixels_per_slice", 256))
+    max_slices = int(roc_cfg.get("max_slices", 4096))
+    save_plot = bool(roc_cfg.get("save_plot", True))
+
+    probs_all = []
+    labels_all = []
+    slices_seen = 0
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -120,22 +84,43 @@ def validate(encoder, decoder, loader, criterion, device):
         feat = encoder(x)
         logits = decoder(feat)
         loss = criterion(logits, y)
-        d = dice_score_from_logits(logits, y).item()
+
+        if ignore_empty_dice:
+            d = dice_score_ignore_empty(logits, y, thr=dice_thr)
+        else:
+            d = float(dice_score_from_logits(logits, y, thr=dice_thr).item())
 
         loss_meter.update(loss.item(), n=x.size(0))
         dice_meter.update(d, n=x.size(0))
 
-    return loss_meter.avg, dice_meter.avg
+        if roc_enabled and slices_seen < max_slices:
+            probs = torch.sigmoid(logits)
+            p_s, y_s = sample_pixels_for_roc(
+                probs, y,
+                sample_pixels_per_slice=sp,
+                pos_pixels_per_slice=spp,
+            )
+            probs_all.append(p_s)
+            labels_all.append(y_s)
+            slices_seen += int(x.size(0))
+
+    val_auc = float("nan")
+    if roc_enabled and probs_all:
+        probs_np = np.concatenate(probs_all, axis=0)
+        labels_np = np.concatenate(labels_all, axis=0)
+        fpr, tpr, val_auc = compute_roc_auc(probs_np, labels_np)
+
+        if save_plot:
+            save_roc_plot(fpr, tpr, val_auc, out_dir=out_dir, epoch=epoch)
+
+    return loss_meter.avg, dice_meter.avg, val_auc
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("data_root", type=str)
-    ap.add_argument("--out_dir", type=str, default="../runs/mae_decoder")
-
-    # Config loading (defaults to config.yaml next to this train.py)
+    ap.add_argument("--out_dir", "-o", type=str, default="../runs/mae_decoder")
     ap.add_argument("--config", type=str, default=None, help="Path to config.yaml (default: next to train.py)")
-
     args = ap.parse_args()
 
     # Load config.yaml
@@ -148,19 +133,28 @@ def main():
     if not mae_ckpt:
         raise ValueError("mae_ckpt must be set in config.yaml")
 
-    # Pull values from config with defaults
     seed = int(deep_get(cfg, "seed", 1337))
+    set_seed(seed)
 
+    # Data cfg
     out_size = int(deep_get(cfg, "data.out_size", 224))
-    k_slices = int(deep_get(cfg, "data.k_slices", 3))
     val_frac = float(deep_get(cfg, "data.val_frac", 0.2))
-    lesion_sampling_cfg = deep_get(cfg, "data.lesion_sampling", 0.7)
-    auto_lesion_sampling = isinstance(lesion_sampling_cfg, str) and lesion_sampling_cfg.strip().lower() == "auto"
-    lesion_sampling = float(lesion_sampling_cfg) if not auto_lesion_sampling else 0.0
-    img_key = str(deep_get(cfg, "data.img_key", "img"))
     mask_key = str(deep_get(cfg, "data.mask_key", "mask"))
     normalize = bool(deep_get(cfg, "data.normalize", True))
 
+    channel_mode = str(deep_get(cfg, "data.channel_mode", "modalities")).lower().strip()
+    modality_keys = deep_get(cfg, "data.modality_keys", ["dwi", "adc", "flair"])
+    img_key = str(deep_get(cfg, "data.img_key", "img"))
+    k_slices = int(deep_get(cfg, "data.k_slices", 3))
+
+    empty_slice_prob = float(deep_get(cfg, "data.empty_slice_prob", 0.1))
+    val_empty_slice_prob = float(deep_get(cfg, "data.val_empty_slice_prob", 0.0))
+
+    crop_enabled = bool(deep_get(cfg, "data.crop.enabled", False))
+    crop_size_native = int(deep_get(cfg, "data.crop.size_native", 96))
+    crop_jitter = float(deep_get(cfg, "data.crop.jitter", 0.15))
+
+    # Train cfg
     epochs = int(deep_get(cfg, "train.epochs", 30))
     batch_size = int(deep_get(cfg, "train.batch_size", 16))
     num_workers = int(deep_get(cfg, "train.num_workers", 4))
@@ -169,12 +163,17 @@ def main():
     lr = float(deep_get(cfg, "optim.lr", 1e-3))
     wd = float(deep_get(cfg, "optim.wd", 0.05))
 
-    # Focal-Dice defaults
+    # Loss cfg
     focal_gamma = float(deep_get(cfg, "loss.focal_gamma", 1.0))
     alpha_pos = float(deep_get(cfg, "loss.alpha_pos", 0.75))
     alpha_neg = float(deep_get(cfg, "loss.alpha_neg", 0.25))
+    focal_w = float(deep_get(cfg, "loss.focal_w", 0.5))
+    dice_w = float(deep_get(cfg, "loss.dice_w", 0.5))
 
-    set_seed(seed)
+    # Metrics cfg
+    dice_thr = float(deep_get(cfg, "metrics.dice_thr", 0.5))
+    ignore_empty_in_dice = bool(deep_get(cfg, "metrics.ignore_empty_in_dice", True))
+    roc_cfg = deep_get(cfg, "metrics.roc", {}) or {}
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_dir = Path(args.out_dir)
@@ -187,33 +186,42 @@ def main():
     if not npz_paths:
         raise FileNotFoundError(f"No *.npz found in {args.data_root}")
 
-    cases = build_case_index(npz_paths, img_key=img_key, mask_key=mask_key)
+    cases = build_case_index(
+        npz_paths,
+        mask_key=mask_key,
+        channel_mode=channel_mode,
+        modality_keys=modality_keys,
+        img_key=img_key,
+    )
     train_cases, val_cases = split_cases(cases, val_frac=val_frac, seed=seed)
-
-    if auto_lesion_sampling:
-        total_slices = sum(c.num_slices for c in train_cases)
-        lesion_slices = sum(len(c.lesion_slices) for c in train_cases)
-        lesion_sampling = lesion_slices / total_slices if total_slices > 0 else 0.0
-        lesion_sampling = max(0.0, min(1.0, lesion_sampling))
-        print(f"Auto lesion_sampling: {lesion_sampling:.4f} ({lesion_slices}/{total_slices} slices with lesions in train set)")
 
     train_ds = NpzSliceDataset(
         train_cases,
         out_size=out_size,
-        k_slices=k_slices,
-        lesion_sampling=lesion_sampling,
+        channel_mode=channel_mode,
+        modality_keys=modality_keys,
         img_key=img_key,
+        k_slices=k_slices,
         mask_key=mask_key,
+        empty_slice_prob=empty_slice_prob,
         normalize=normalize,
+        crop_enabled=crop_enabled,
+        crop_size_native=crop_size_native,
+        crop_jitter=crop_jitter,
     )
     val_ds = NpzSliceDataset(
         val_cases,
         out_size=out_size,
-        k_slices=k_slices,
-        lesion_sampling=0.0,
+        channel_mode=channel_mode,
+        modality_keys=modality_keys,
         img_key=img_key,
+        k_slices=k_slices,
         mask_key=mask_key,
+        empty_slice_prob=val_empty_slice_prob,
         normalize=normalize,
+        crop_enabled=crop_enabled,   # keep consistent; you can set false in cfg if you want
+        crop_size_native=crop_size_native,
+        crop_jitter=crop_jitter,
     )
 
     train_loader = DataLoader(
@@ -236,7 +244,6 @@ def main():
     # -----------------
     # Model
     # -----------------
-    # Create ViT-B/16 with img_size matching out_size (so pos_embed length matches)
     vit = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0, img_size=out_size)
     vit.to(device)
 
@@ -253,20 +260,41 @@ def main():
     # -----------------
     # Loss / opt
     # -----------------
-    criterion = FocalDiceLoss(gamma=focal_gamma, alpha_pos=alpha_pos, alpha_neg=alpha_neg).to(device)
+    criterion = FocalDiceLoss(
+        gamma=focal_gamma,
+        alpha_pos=alpha_pos,
+        alpha_neg=alpha_neg,
+        focal_w=focal_w,
+        dice_w=dice_w,
+    ).to(device)
     optimizer = torch.optim.AdamW(decoder.parameters(), lr=lr, weight_decay=wd)
 
     # -----------------
     # Train
     # -----------------
     best_val_dice = -1.0
-    for ep in range(1, epochs + 1):
-        tr_loss, tr_dice = train_one_epoch(encoder, decoder, train_loader, criterion, optimizer, device, amp=amp)
-        va_loss, va_dice = validate(encoder, decoder, val_loader, criterion, device)
+    best_val_auc = float("-inf")
 
-        print(f"[{ep:03d}/{epochs}] "
-              f"train loss={tr_loss:.4f} dice={tr_dice:.4f} | "
-              f"val loss={va_loss:.4f} dice={va_dice:.4f}")
+    for ep in range(1, epochs + 1):
+        tr_loss, tr_dice = train_one_epoch(
+            encoder, decoder, train_loader, criterion, optimizer, device,
+            amp=amp, dice_thr=dice_thr, ignore_empty_dice=ignore_empty_in_dice
+        )
+        va_loss, va_dice, va_auc = validate(
+            encoder, decoder, val_loader, criterion, device,
+            dice_thr=dice_thr,
+            ignore_empty_dice=ignore_empty_in_dice,
+            roc_cfg=roc_cfg,
+            out_dir=out_dir,
+            epoch=ep,
+        )
+
+        msg = (f"[{ep:03d}/{epochs}] "
+               f"train loss={tr_loss:.4f} dice={tr_dice:.4f} | "
+               f"val loss={va_loss:.4f} dice={va_dice:.4f}")
+        if bool(roc_cfg.get("enabled", False)):
+            msg += f" auc={va_auc:.4f}"
+        print(msg)
 
         ckpt = {
             "epoch": ep,
@@ -276,6 +304,8 @@ def main():
             "runtime": {
                 "device": device,
                 "out_size": out_size,
+                "channel_mode": channel_mode,
+                "modality_keys": modality_keys,
                 "k_slices": k_slices,
                 "batch_size": batch_size,
                 "lr": lr,
@@ -283,6 +313,7 @@ def main():
                 "amp": amp,
             },
             "val_dice": va_dice,
+            "val_auc": va_auc,
         }
         save_checkpoint(str(out_dir / "last.pth"), ckpt)
 
@@ -291,7 +322,15 @@ def main():
             save_checkpoint(str(out_dir / "best.pth"), ckpt)
             print(f"  ✓ new best val dice: {best_val_dice:.4f}")
 
+        # optional: also track best AUROC
+        if (not np.isnan(va_auc)) and (va_auc > best_val_auc):
+            best_val_auc = va_auc
+            save_checkpoint(str(out_dir / "best_auc.pth"), ckpt)
+            print(f"  ✓ new best val auc: {best_val_auc:.4f}")
+
     print("Done. Best val dice:", best_val_dice)
+    if bool(roc_cfg.get("enabled", False)):
+        print("Done. Best val auc:", best_val_auc)
 
 
 if __name__ == "__main__":

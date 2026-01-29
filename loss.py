@@ -83,3 +83,14 @@ def dice_score_from_logits(logits: torch.Tensor, targets: torch.Tensor, thr: flo
     denom = pred.sum(dim=1) + targets.sum(dim=1)
     dice = (2.0 * inter + eps) / (denom + eps)
     return dice.mean()
+
+def dice_score_ignore_empty(logits: torch.Tensor, targets: torch.Tensor, thr: float = 0.5) -> float:
+    """
+    Dice computed only on samples where GT has any positive pixel.
+    Prevents empty-slice dice~=1 inflating metrics.
+    """
+    B = targets.size(0)
+    has_pos = (targets.view(B, -1).sum(dim=1) > 0)
+    if not torch.any(has_pos):
+        return 0.0
+    return float(dice_score_from_logits(logits[has_pos], targets[has_pos], thr=thr).item())

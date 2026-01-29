@@ -7,8 +7,35 @@ import torch.nn.functional as F
 import timm
 import matplotlib.pyplot as plt
 
-from train import FrozenMAEEncoder, SimpleUpsampleDecoder
+from model import FrozenMAEEncoder, SimpleUpsampleDecoder
 from utils import load_yaml_config, deep_get, load_mae_vitb16_encoder_weights
+
+
+def normalize_channels(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32, copy=False)
+    out = np.empty_like(x, dtype=np.float32)
+    for c in range(x.shape[0]):
+        v = x[c]
+        lo, hi = np.percentile(v, [0.5, 99.5])
+        v = np.clip(v, lo, hi)
+        mu = float(v.mean())
+        sd = float(v.std()) + 1e-6
+        out[c] = (v - mu) / sd
+    return out
+
+
+def load_case_multimodal(npz_path: str, modality_keys, mask_key: str):
+    d = np.load(npz_path, allow_pickle=False)
+    vols = [d[k].astype(np.float32) for k in modality_keys]  # list of [Z,H,W]
+    mask = d[mask_key].astype(np.uint8)                      # [Z,H,W]
+    return vols, mask
+
+
+def load_case_zstack(npz_path: str, img_key: str, mask_key: str):
+    d = np.load(npz_path, allow_pickle=False)
+    img = d[img_key].astype(np.float32)      # [Z,H,W]
+    mask = d[mask_key].astype(np.uint8)      # [Z,H,W]
+    return img, mask
 
 
 def stack_slices(vol, z, k):
@@ -26,27 +53,8 @@ def stack_slices(vol, z, k):
     return vol[idxs, :, :]
 
 
-def normalize_slice_stack(x):
-    # x: [C,H,W] float32
-    center = x[x.shape[0] // 2]
-    lo, hi = np.percentile(center, [0.5, 99.5])
-    x = np.clip(x, lo, hi)
-    mu = x.mean()
-    sd = x.std() + 1e-6
-    x = (x - mu) / sd
-    return x.astype(np.float32, copy=False)
-
-
-def load_case(npz_path, img_key, mask_key):
-    d = np.load(npz_path, allow_pickle=False)
-    img = d[img_key].astype(np.float32)
-    mask = d[mask_key].astype(np.uint8)
-    return img, mask
-
-
 def prepare_model(cfg, device):
     out_size = int(deep_get(cfg, "data.out_size", 224))
-    amp = bool(deep_get(cfg, "train.amp", False))
 
     vit = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0, img_size=out_size)
     vit.to(device)
@@ -55,6 +63,7 @@ def prepare_model(cfg, device):
     if not mae_ckpt:
         raise ValueError("mae_ckpt missing in config")
     load_mae_vitb16_encoder_weights(vit, mae_ckpt, device=device)
+
     vit.eval()
     for p in vit.parameters():
         p.requires_grad = False
@@ -62,8 +71,21 @@ def prepare_model(cfg, device):
     encoder = FrozenMAEEncoder(vit).to(device)
     decoder = SimpleUpsampleDecoder(in_ch=768, out_size=out_size, patch=16, mid_ch=256).to(device)
     decoder.eval()
+    return encoder, decoder, out_size
 
-    return encoder, decoder, out_size, amp
+
+def predict_slice(encoder, decoder, x_np: np.ndarray, device, out_size: int, threshold: float):
+    """Run model on a single slice stack and return prob map + binary mask."""
+    xt = torch.from_numpy(x_np).unsqueeze(0).to(device)  # [1,C,H,W]
+    xt = F.interpolate(xt, size=(out_size, out_size), mode="bilinear", align_corners=False)
+
+    with torch.no_grad():
+        feat = encoder(xt)
+        logits = decoder(feat)
+        probs = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
+        pred = (probs > float(threshold)).astype(np.uint8)
+
+    return probs, pred
 
 
 def visualize(slice_img, gt_mask, pred_mask, out_path, title):
@@ -90,13 +112,13 @@ def visualize(slice_img, gt_mask, pred_mask, out_path, title):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("npz_path", type=str, help="Path to case npz containing img/mask")
+    ap.add_argument("npz_path", type=str, help="Path to case npz")
     ap.add_argument("checkpoint", type=str, help="Path to trained decoder checkpoint (best.pth)")
     ap.add_argument("--config", type=str, default=None, help="Optional config.yaml path (fallback to checkpoint config)")
     ap.add_argument("--out_dir", type=str, default="outputs/infer", help="Directory to save visualizations")
     ap.add_argument("--device", type=str, default=None, help="Override device, e.g., cpu or cuda:0")
     ap.add_argument("--threshold", type=float, default=0.5, help="Probability threshold for binary mask")
-    ap.add_argument("--verbose", "-v", action="store_true", help="If set, enables verbose logging")
+    ap.add_argument("--z", type=int, default=None, help="Slice index to visualize (default: middle slice)")
     args = ap.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -106,60 +128,76 @@ def main():
     if not cfg:
         raise ValueError("Config not found; provide --config or ensure checkpoint contains config")
 
-    encoder, decoder, out_size, amp = prepare_model(cfg, device)
+    encoder, decoder, out_size = prepare_model(cfg, device)
 
     # Load decoder weights
     decoder_sd = ckpt.get("decoder", ckpt)
     decoder.load_state_dict(decoder_sd, strict=False)
 
-    k_slices = int(deep_get(cfg, "data.k_slices", 3))
-    normalize = bool(deep_get(cfg, "data.normalize", True))
-    img_key = str(deep_get(cfg, "data.img_key", "img"))
+    channel_mode = str(deep_get(cfg, "data.channel_mode", "modalities")).lower().strip()
     mask_key = str(deep_get(cfg, "data.mask_key", "mask"))
+    normalize = bool(deep_get(cfg, "data.normalize", True))
 
-    img, mask = load_case(args.npz_path, img_key, mask_key)
-    Z = img.shape[0]
-    lesion_slices = np.where(mask.reshape(Z, -1).sum(axis=1) > 0)[0].tolist()
-    if not lesion_slices:
-        print("No lesion slices found in this case; nothing to visualize.")
-        return
+    if channel_mode == "modalities":
+        modality_keys = deep_get(cfg, "data.modality_keys", ["dwi", "adc", "flair"])
+        vols, mask = load_case_multimodal(args.npz_path, modality_keys, mask_key)
+
+        def build_input(z_idx: int):
+            x_np = np.stack([v[z_idx] for v in vols], axis=0)  # [C,H,W]
+            return x_np, vols[0][z_idx]  # show DWI by default
+
+    else:
+        img_key = str(deep_get(cfg, "data.img_key", "img"))
+        k_slices = int(deep_get(cfg, "data.k_slices", 3))
+        img, mask = load_case_zstack(args.npz_path, img_key, mask_key)
+
+        def build_input(z_idx: int):
+            x_np = stack_slices(img, z_idx, k_slices)  # [C,H,W]
+            return x_np, img[z_idx]
 
     out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    for z in lesion_slices:
-        if mask[z].sum() == 0:
-            continue
-        stack = stack_slices(img, z, k_slices)
-        stack_norm = normalize_slice_stack(stack) if normalize else stack.astype(np.float32)
+    # Choose slices: user-provided z or all slices with non-zero GT mask
+    mask_nonzero = (mask.reshape(mask.shape[0], -1).max(axis=1) > 0)
+    target_slices = [int(args.z)] if args.z is not None else list(np.where(mask_nonzero)[0])
 
-        xt = torch.from_numpy(stack_norm).unsqueeze(0)  # [1,C,H,W]
-        xt = F.interpolate(xt, size=(out_size, out_size), mode="bilinear", align_corners=False)
-        xt = xt.to(device)
+    if not target_slices:
+        print("No non-zero slices in mask; nothing to predict.")
+        return
 
-        with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=amp and device.startswith("cuda")):
-            feat = encoder(xt)
-            logits = decoder(feat)
-            pred = torch.sigmoid(logits)
+    saved = 0
+    for z in target_slices:
+        x_np, slice_img = build_input(z)
+        y = (mask[z] > 0).astype(np.uint8)
 
-        pred_np = pred.squeeze(0).squeeze(0).cpu().numpy()
-        if args.verbose:
-            print(f"max proba: {pred_np.max():.4f}, min proba: {pred_np.min():.4f}, mean proba: {pred_np.mean():.4f}")
-        pred_bin = (pred_np >= args.threshold).astype(np.float32)
-        gt_mask = mask[z].astype(np.float32)
+        if normalize:
+            x_np = normalize_channels(x_np)
 
-        # Resize gt to match out_size for fair overlay
-        gt_t = torch.from_numpy(gt_mask)[None, None]
-        gt_resized = F.interpolate(gt_t, size=(out_size, out_size), mode="nearest").squeeze().numpy()
+        probs, pred = predict_slice(encoder, decoder, x_np, device, out_size, args.threshold)
 
-        center_slice = stack[k_slices // 2]
-        if center_slice.shape != (out_size, out_size):
-            center_t = torch.from_numpy(center_slice)[None, None]
-            center_slice = F.interpolate(center_t, size=(out_size, out_size), mode="bilinear", align_corners=False).squeeze().numpy()
+        y_t = torch.from_numpy(y[None, None].astype(np.float32))
+        y_t = F.interpolate(y_t, size=(out_size, out_size), mode="nearest")[0, 0].numpy().astype(np.uint8)
 
-        out_path = out_dir / f"slice_{z:03d}.png"
-        visualize(center_slice, gt_resized, pred_bin, out_path, title=f"z={z} (thr={args.threshold})")
-        if args.verbose:
-            print(f"Saved {out_path}")
+        slice_img_resized = F.interpolate(
+            torch.from_numpy(slice_img[None, None].astype(np.float32)),
+            size=(out_size, out_size),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0].numpy()
+
+        out_path = out_dir / (Path(args.npz_path).stem + f"_z{z:03d}_thr{args.threshold:.2f}.png")
+        visualize(
+            slice_img=slice_img_resized,
+            gt_mask=y_t,
+            pred_mask=pred,
+            out_path=out_path,
+            title=f"z={z} (thr={args.threshold})"
+        )
+        saved += 1
+        print("Saved:", out_path)
+
+    print(f"Done. Saved {saved} slice(s) to {out_dir}.")
 
 
 if __name__ == "__main__":
