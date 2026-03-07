@@ -245,3 +245,13 @@ def save_roc_plot(fpr, tpr, auc, out_dir: str, epoch: int):
     plt.tight_layout()
     plt.savefig(fig_path, dpi=200)
     plt.close()
+
+def compute_accuracy(logits, targets, threshold=0.5):
+    """
+    logits: [B, 1]
+    targets: [B, 1] (0 or 1)
+    """
+    probs = torch.sigmoid(logits)
+    preds = (probs > threshold).float()
+    correct = (preds == targets).float().sum()
+    return correct / targets.numel()

@@ -1,337 +1,105 @@
-import argparse
-from pathlib import Path
-
-import numpy as np
+import matplotlib
+matplotlib.use('Agg') 
+import os
+import pandas as pd
 import torch
+import torch.optim as optim
 from torch.utils.data import DataLoader
-import timm
+from tqdm import tqdm
+from model import MAESegmenter
+from data import IslesNpzDataset
+from loss import CombinedLoss
 
-from data import build_case_index, split_cases, NpzSliceDataset
-from loss import FocalDiceLoss, dice_score_from_logits, dice_score_ignore_empty
-from utils import (
-    set_seed, AverageMeter, save_checkpoint,
-    load_mae_vitb16_encoder_weights,
-    load_yaml_config, deep_get, compute_roc_auc, sample_pixels_for_roc,
-    save_roc_plot
-)
-from model import FrozenMAEEncoder, SimpleUpsampleDecoder
+# --- 队友的新路径 ---
+DATA_ROOT = "../ISLES-2022-npz-multimodal_clean/all"
+TRAIN_LIST = "../ISLES-2022-npz-multimodal_clean/splits/train.txt"
+VAL_LIST = "../ISLES-2022-npz-multimodal_clean/splits/val.txt"
+OUTPUT_DIR = "../runs/terence_strategy"
 
-
-def train_one_epoch(encoder, decoder, loader, criterion, optimizer, device, amp: bool, dice_thr: float, ignore_empty_dice: bool):
-    encoder.eval()
-    decoder.train()
-
-    loss_meter = AverageMeter()
-    dice_meter = AverageMeter()
-
-    scaler = torch.amp.GradScaler("cuda", enabled=amp)
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        with torch.amp.autocast("cuda", enabled=amp):
-            feat = encoder(x)
-            logits = decoder(feat)
-            loss = criterion(logits, y)
-
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        with torch.no_grad():
-            if ignore_empty_dice:
-                d = dice_score_ignore_empty(logits, y, thr=dice_thr)
-            else:
-                d = float(dice_score_from_logits(logits, y, thr=dice_thr).item())
-
-        loss_meter.update(loss.item(), n=x.size(0))
-        dice_meter.update(d, n=x.size(0))
-
-    return loss_meter.avg, dice_meter.avg
-
-
-@torch.no_grad()
-def validate(
-    encoder, decoder, loader, criterion, device,
-    dice_thr: float,
-    ignore_empty_dice: bool,
-    roc_cfg: dict,
-    out_dir: Path,
-    epoch: int,
-):
-    encoder.eval()
-    decoder.eval()
-
-    loss_meter = AverageMeter()
-    dice_meter = AverageMeter()
-
-    roc_enabled = bool(roc_cfg.get("enabled", False))
-    sp = int(roc_cfg.get("sample_pixels_per_slice", 2048))
-    spp = int(roc_cfg.get("pos_pixels_per_slice", 256))
-    max_slices = int(roc_cfg.get("max_slices", 4096))
-    save_plot = bool(roc_cfg.get("save_plot", True))
-
-    probs_all = []
-    labels_all = []
-    slices_seen = 0
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        feat = encoder(x)
-        logits = decoder(feat)
-        loss = criterion(logits, y)
-
-        if ignore_empty_dice:
-            d = dice_score_ignore_empty(logits, y, thr=dice_thr)
-        else:
-            d = float(dice_score_from_logits(logits, y, thr=dice_thr).item())
-
-        loss_meter.update(loss.item(), n=x.size(0))
-        dice_meter.update(d, n=x.size(0))
-
-        if roc_enabled and slices_seen < max_slices:
-            probs = torch.sigmoid(logits)
-            p_s, y_s = sample_pixels_for_roc(
-                probs, y,
-                sample_pixels_per_slice=sp,
-                pos_pixels_per_slice=spp,
-            )
-            probs_all.append(p_s)
-            labels_all.append(y_s)
-            slices_seen += int(x.size(0))
-
-    val_auc = float("nan")
-    if roc_enabled and probs_all:
-        probs_np = np.concatenate(probs_all, axis=0)
-        labels_np = np.concatenate(labels_all, axis=0)
-        fpr, tpr, val_auc = compute_roc_auc(probs_np, labels_np)
-
-        if save_plot:
-            save_roc_plot(fpr, tpr, val_auc, out_dir=out_dir, epoch=epoch)
-
-    return loss_meter.avg, dice_meter.avg, val_auc
-
+BATCH_SIZE = 16 
+EPOCHS = 30
+LR = 1e-4
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("data_root", type=str)
-    ap.add_argument("--out_dir", "-o", type=str, default="../runs/mae_decoder")
-    ap.add_argument("--config", type=str, default=None, help="Path to config.yaml (default: next to train.py)")
-    args = ap.parse_args()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # Load config.yaml
-    default_cfg_path = Path(__file__).resolve().parent / "config.yaml"
-    cfg_path = Path(args.config).expanduser().resolve() if args.config else default_cfg_path
-    cfg = load_yaml_config(str(cfg_path))
-    print(f"Config: {cfg_path} ({'loaded' if cfg else 'not found/empty -> using defaults'})")
+    train_ds = IslesNpzDataset(DATA_ROOT, TRAIN_LIST)
+    val_ds = IslesNpzDataset(DATA_ROOT, VAL_LIST)
+    
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=12, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=12)
 
-    mae_ckpt = deep_get(cfg, "mae_ckpt", None)
-    if not mae_ckpt:
-        raise ValueError("mae_ckpt must be set in config.yaml")
+    model = MAESegmenter(num_classes=1).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LR)
+    criterion = CombinedLoss()
 
-    seed = int(deep_get(cfg, "seed", 1337))
-    set_seed(seed)
+    best_dice = 0.0
+    epoch_metrics = []
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        epoch_loss = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        
+        for imgs, masks in pbar:
+            imgs, masks = imgs.to(device), masks.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            
+        # Validation
+        model.eval()
+        val_loss_sum = 0
+        val_dice_sum = 0
+        val_iou_sum = 0
+        with torch.no_grad():
+            for v_imgs, v_masks in val_loader:
+                v_imgs, v_masks = v_imgs.to(device), v_masks.to(device)
+                v_out = model(v_imgs)
+                v_loss = criterion(v_out, v_masks)
+                pred = (torch.sigmoid(v_out) > 0.5).float()
+                intersection = (pred * v_masks).sum()
+                pred_sum = pred.sum()
+                target_sum = v_masks.sum()
+                dice = (2. * intersection) / (pred_sum + target_sum + 1e-8)
+                iou = intersection / (pred_sum + target_sum - intersection + 1e-8)
+                val_loss_sum += v_loss.item()
+                val_dice_sum += dice.item()
+                val_iou_sum += iou.item()
 
-    # Data cfg
-    out_size = int(deep_get(cfg, "data.out_size", 224))
-    val_frac = float(deep_get(cfg, "data.val_frac", 0.2))
-    mask_key = str(deep_get(cfg, "data.mask_key", "mask"))
-    normalize = bool(deep_get(cfg, "data.normalize", True))
+        avg_train_loss = epoch_loss / len(train_loader)
+        avg_val_loss = val_loss_sum / len(val_loader)
+        avg_val_dice = val_dice_sum / len(val_loader)
+        avg_val_iou = val_iou_sum / len(val_loader)
 
-    channel_mode = str(deep_get(cfg, "data.channel_mode", "modalities")).lower().strip()
-    modality_keys = deep_get(cfg, "data.modality_keys", ["dwi", "adc", "flair"])
-    img_key = str(deep_get(cfg, "data.img_key", "img"))
-    k_slices = int(deep_get(cfg, "data.k_slices", 3))
+        epoch_metrics.append({
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "dice": avg_val_dice,
+            "iou": avg_val_iou,
+        })
 
-    empty_slice_prob = float(deep_get(cfg, "data.empty_slice_prob", 0.1))
-    val_empty_slice_prob = float(deep_get(cfg, "data.val_empty_slice_prob", 0.0))
-
-    crop_enabled = bool(deep_get(cfg, "data.crop.enabled", False))
-    crop_size_native = int(deep_get(cfg, "data.crop.size_native", 96))
-    crop_jitter = float(deep_get(cfg, "data.crop.jitter", 0.15))
-
-    # Train cfg
-    epochs = int(deep_get(cfg, "train.epochs", 30))
-    batch_size = int(deep_get(cfg, "train.batch_size", 16))
-    num_workers = int(deep_get(cfg, "train.num_workers", 4))
-    amp = bool(deep_get(cfg, "train.amp", False))
-
-    lr = float(deep_get(cfg, "optim.lr", 1e-3))
-    wd = float(deep_get(cfg, "optim.wd", 0.05))
-
-    # Loss cfg
-    focal_gamma = float(deep_get(cfg, "loss.focal_gamma", 1.0))
-    alpha_pos = float(deep_get(cfg, "loss.alpha_pos", 0.75))
-    alpha_neg = float(deep_get(cfg, "loss.alpha_neg", 0.25))
-    focal_w = float(deep_get(cfg, "loss.focal_w", 0.5))
-    dice_w = float(deep_get(cfg, "loss.dice_w", 0.5))
-
-    # Metrics cfg
-    dice_thr = float(deep_get(cfg, "metrics.dice_thr", 0.5))
-    ignore_empty_in_dice = bool(deep_get(cfg, "metrics.ignore_empty_in_dice", True))
-    roc_cfg = deep_get(cfg, "metrics.roc", {}) or {}
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # -----------------
-    # Data
-    # -----------------
-    npz_paths = sorted(str(p) for p in Path(args.data_root).glob("*.npz"))
-    if not npz_paths:
-        raise FileNotFoundError(f"No *.npz found in {args.data_root}")
-
-    cases = build_case_index(
-        npz_paths,
-        mask_key=mask_key,
-        channel_mode=channel_mode,
-        modality_keys=modality_keys,
-        img_key=img_key,
-    )
-    train_cases, val_cases = split_cases(cases, val_frac=val_frac, seed=seed)
-
-    train_ds = NpzSliceDataset(
-        train_cases,
-        out_size=out_size,
-        channel_mode=channel_mode,
-        modality_keys=modality_keys,
-        img_key=img_key,
-        k_slices=k_slices,
-        mask_key=mask_key,
-        empty_slice_prob=empty_slice_prob,
-        normalize=normalize,
-        crop_enabled=crop_enabled,
-        crop_size_native=crop_size_native,
-        crop_jitter=crop_jitter,
-    )
-    val_ds = NpzSliceDataset(
-        val_cases,
-        out_size=out_size,
-        channel_mode=channel_mode,
-        modality_keys=modality_keys,
-        img_key=img_key,
-        k_slices=k_slices,
-        mask_key=mask_key,
-        empty_slice_prob=val_empty_slice_prob,
-        normalize=normalize,
-        crop_enabled=crop_enabled,   # keep consistent; you can set false in cfg if you want
-        crop_size_native=crop_size_native,
-        crop_jitter=crop_jitter,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    # -----------------
-    # Model
-    # -----------------
-    vit = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0, img_size=out_size)
-    vit.to(device)
-
-    epoch_loaded, info = load_mae_vitb16_encoder_weights(vit, mae_ckpt, device=device)
-    print(f"Loaded MAE weights (epoch={epoch_loaded}) -> {info}")
-
-    vit.eval()
-    for p in vit.parameters():
-        p.requires_grad = False
-
-    encoder = FrozenMAEEncoder(vit).to(device)
-    decoder = SimpleUpsampleDecoder(in_ch=768, out_size=out_size, patch=16, mid_ch=256).to(device)
-
-    # -----------------
-    # Loss / opt
-    # -----------------
-    criterion = FocalDiceLoss(
-        gamma=focal_gamma,
-        alpha_pos=alpha_pos,
-        alpha_neg=alpha_neg,
-        focal_w=focal_w,
-        dice_w=dice_w,
-    ).to(device)
-    optimizer = torch.optim.AdamW(decoder.parameters(), lr=lr, weight_decay=wd)
-
-    # -----------------
-    # Train
-    # -----------------
-    best_val_dice = -1.0
-    best_val_auc = float("-inf")
-
-    for ep in range(1, epochs + 1):
-        tr_loss, tr_dice = train_one_epoch(
-            encoder, decoder, train_loader, criterion, optimizer, device,
-            amp=amp, dice_thr=dice_thr, ignore_empty_dice=ignore_empty_in_dice
-        )
-        va_loss, va_dice, va_auc = validate(
-            encoder, decoder, val_loader, criterion, device,
-            dice_thr=dice_thr,
-            ignore_empty_dice=ignore_empty_in_dice,
-            roc_cfg=roc_cfg,
-            out_dir=out_dir,
-            epoch=ep,
+        print(
+            f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | "
+            f"Val Loss: {avg_val_loss:.4f} | Val Dice: {avg_val_dice:.4f} | Val IoU: {avg_val_iou:.4f}"
         )
 
-        msg = (f"[{ep:03d}/{epochs}] "
-               f"train loss={tr_loss:.4f} dice={tr_dice:.4f} | "
-               f"val loss={va_loss:.4f} dice={va_dice:.4f}")
-        if bool(roc_cfg.get("enabled", False)):
-            msg += f" auc={va_auc:.4f}"
-        print(msg)
+        if avg_val_dice > best_dice:
+            best_dice = avg_val_dice
+            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best_terence.pth"))
+            print(f"Saved Best Model (Dice: {best_dice:.4f})")
 
-        ckpt = {
-            "epoch": ep,
-            "decoder": decoder.state_dict(),
-            "config_path": str(cfg_path),
-            "config": cfg,
-            "runtime": {
-                "device": device,
-                "out_size": out_size,
-                "channel_mode": channel_mode,
-                "modality_keys": modality_keys,
-                "k_slices": k_slices,
-                "batch_size": batch_size,
-                "lr": lr,
-                "wd": wd,
-                "amp": amp,
-            },
-            "val_dice": va_dice,
-            "val_auc": va_auc,
-        }
-        save_checkpoint(str(out_dir / "last.pth"), ckpt)
-
-        if va_dice > best_val_dice:
-            best_val_dice = va_dice
-            save_checkpoint(str(out_dir / "best.pth"), ckpt)
-            print(f"  ✓ new best val dice: {best_val_dice:.4f}")
-
-        # optional: also track best AUROC
-        if (not np.isnan(va_auc)) and (va_auc > best_val_auc):
-            best_val_auc = va_auc
-            save_checkpoint(str(out_dir / "best_auc.pth"), ckpt)
-            print(f"  ✓ new best val auc: {best_val_auc:.4f}")
-
-    print("Done. Best val dice:", best_val_dice)
-    if bool(roc_cfg.get("enabled", False)):
-        print("Done. Best val auc:", best_val_auc)
-
+    metrics_df = pd.DataFrame(epoch_metrics)
+    metrics_csv_path = os.path.join(OUTPUT_DIR, "training_metrics.csv")
+    metrics_df.to_csv(metrics_csv_path, index=False)
+    print(f"Saved training metrics CSV to {metrics_csv_path}")
 
 if __name__ == "__main__":
     main()

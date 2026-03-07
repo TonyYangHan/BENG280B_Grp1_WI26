@@ -47,6 +47,35 @@ def to_ZHW(arr_xyz: np.ndarray) -> np.ndarray:
     return np.moveaxis(arr_xyz, -1, 0)  # [Z,X,Y]
 
 
+def drop_small_components_mask(mask: np.ndarray, min_voxels: int = 3) -> np.ndarray:
+    """Remove 3D connected components smaller than min_voxels."""
+    try:
+        from scipy.ndimage import label, generate_binary_structure
+    except ImportError as e:
+        raise ImportError("Install scipy to use --drop option.") from e
+
+    if mask.ndim != 3:
+        raise ValueError(f"mask must be 3D, got {mask.ndim}D")
+
+    structure = generate_binary_structure(rank=3, connectivity=1)  # 6-neighbor 3D connectivity
+    labeled, n_labels = label(mask, structure=structure)
+    if n_labels == 0:
+        return mask
+
+    counts = np.bincount(labeled.ravel())
+    small_labels = np.where(counts < min_voxels)[0]
+    if len(small_labels) == 0:
+        return mask
+
+    mask = mask.copy()
+    # Label 0 is background; skip it.
+    for lbl in small_labels:
+        if lbl == 0:
+            continue
+        mask[labeled == lbl] = 0
+    return mask
+
+
 def find_quadruples(isles_root: Path) -> List[Tuple[str, Path, Path, Path, Path]]:
     """
     Returns list of (case_id, dwi_path, adc_path, flair_path, mask_path)
@@ -89,6 +118,7 @@ def write_npz_for_case(
     msk_path: Path,
     out_npz_path: Path,
     allow_resample: bool = True,
+    drop_small_components: bool = False,
 ) -> Dict[str, Any]:
     # Load
     dwi_nii, dwi = load_canonical_nii(dwi_path)
@@ -136,11 +166,19 @@ def write_npz_for_case(
                 f"Original error: {repr(e)}"
             )
 
+    # Optional mask cleanup: drop tiny 3D components
+    msk_bool = msk > 0.5
+    dropped_voxels = 0
+    if drop_small_components:
+        msk_clean = drop_small_components_mask(msk_bool, min_voxels=3)
+        dropped_voxels = max(0, int(msk_bool.sum() - msk_clean.sum()))
+        msk_bool = msk_clean
+
     # Convert to [Z,H,W]
     dwi_zhw = to_ZHW(dwi).astype(np.float32)
     adc_zhw = to_ZHW(adc).astype(np.float32)
     flair_zhw = to_ZHW(flair).astype(np.float32)
-    msk_zhw = (to_ZHW(msk) > 0.5).astype(np.uint8)
+    msk_zhw = to_ZHW(msk_bool).astype(np.uint8)
 
     nonzero = int(msk_zhw.sum())
     np.savez_compressed(out_npz_path, dwi=dwi_zhw, adc=adc_zhw, flair=flair_zhw, mask=msk_zhw)
@@ -154,6 +192,7 @@ def write_npz_for_case(
         "out_npz": str(out_npz_path),
         "shape_ZHW": str(tuple(dwi_zhw.shape)),
         "mask_nonzero": nonzero,
+        "mask_dropped_voxels": dropped_voxels,
     }
 
 
@@ -164,6 +203,8 @@ def main():
     ap.add_argument("--val_frac", "-f", type=float, default=0.2, help="Validation fraction (by case)")
     ap.add_argument("--seed", "-s", type=int, default=42, help="Split seed")
     ap.add_argument("--allow_resample", "-rs", action="store_true", help="If set, resample ADC/FLAIR/MASK if misaligned with DWI")
+    ap.add_argument("--drop", "-d", action="store_true",
+                    help="If set, drop 3D connected components in the mask with volume < 3 voxels")
     ap.add_argument("--copy_split_files", action="store_true",
                     help="If set, copies NPZ into OUT/train and OUT/val. (Always writes OUT/all)")
     args = ap.parse_args()
@@ -212,6 +253,7 @@ def main():
                     msk_path=msk_path,
                     out_npz_path=out_npz,
                     allow_resample=args.allow_resample,
+                    drop_small_components=args.drop,
                 )
                 row["split"] = split_name
                 manifest_rows.append(row)

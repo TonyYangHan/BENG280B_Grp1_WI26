@@ -1,63 +1,49 @@
-seed: 42
+# --- 模型权重 ---
+# 这是你之前下载好的 Facebook MAE 预训练权重
+# mae_ckpt: "checkpoints/mae_pretrain_vit_base.pth" #initial
+mae_ckpt: "/mnt/c/Users/81493/OneDrive/Desktop/runs/mae_decoder/best.pth"
 
-mae_ckpt: ../mae_pretrain_vit_base.pth
-
+# --- 数据配置 ---
 data:
+  # 训练数据的文件夹 (刚才生成的)
+  # data_root: "data_preprocessed"#original
+  data_root: "/home/tinger/data_fast" #modified
+  
+  # 模型输入尺寸 (虽然数据是112，但MAE需要224，代码会自动放大)
   out_size: 224
+  
+  # 使用多模态模式
+  channel_mode: "modalities"
+  # 对应 preprocess_isles.py 里保存的键名
+  modality_keys: ["dwi", "adc", "flair"]
+  mask_key: "mask"
+  
+  # 验证集比例 (20%用来测试)
   val_frac: 0.2
-  mask_key: mask
+  
+  # 归一化 (非常重要)
+  normalize: True
 
-  # Input mode:
-  # - modalities: channels are [DWI(z), ADC(z), FLAIR(z)]
-  # - zstack: channels are [z-1, z, z+1] from img_key volume
-  channel_mode: modalities
-  modality_keys: [dwi, adc, flair]
-
-  # Only used when channel_mode == zstack
-  img_key: img
-  k_slices: 3
-
-  normalize: true
-
-  # Sampling: default training uses ALL lesion slices + some empty-mask slices
-  # empty_slice_prob = probability that a returned sample is an empty-mask z-slice
-  empty_slice_prob: 0.1
-  # For validation, default keep lesion-only slices
-  val_empty_slice_prob: 0.0
-
-  crop:
-    enabled: false
-    # crop size in NATIVE resolution (e.g. 112x112 -> crop 96x96), then resize to out_size
-    size_native: 96
-    # jitter fraction of crop size (0.15 -> +/- 14 px if crop=96)
-    jitter: 0.15
-
+# --- 训练参数 ---
 train:
-  epochs: 30
-  batch_size: 16
-  num_workers: 8
-  amp: true
+  epochs: 50             # 训练 50 轮
+  batch_size: 16         # 如果显存不够报错(OOM)，可以改小成 8 或 4
+  num_workers: 4         # 加载数据的线程数
+  amp: True              # 开启混合精度训练 (省显存，速度快)
 
+# --- 优化器 ---
 optim:
-  lr: 0.001
-  wd: 0.05
+  lr: 1e-3               # 学习率
+  wd: 0.05               # 权重衰减
 
+# --- 损失函数 ---
 loss:
-  focal_gamma: 1.0
-  alpha_pos: 0.75
-  alpha_neg: 0.25
-  focal_w: 0.5
-  dice_w: 0.5
+  focal_w: 0.5           # Focal Loss 权重 (关注难分类样本)
+  dice_w: 0.5            # Dice Loss 权重 (关注分割形状)
 
+# --- 评估指标 ---
 metrics:
   dice_thr: 0.5
-  ignore_empty_in_dice: true
-
   roc:
-    enabled: true
-    # pixel-level ROC/AUC is computed on a stratified random sample of pixels per slice
-    sample_pixels_per_slice: 2048
-    pos_pixels_per_slice: 256
-    # cap number of slices used for ROC sampling (keeps runtime predictable)
-    max_slices: 4096
-    save_plot: true
+    enabled: True        # 开启你需要的 ROC/AUC 曲线
+    save_plot: True      # 训练时自动保存 AUC 图片

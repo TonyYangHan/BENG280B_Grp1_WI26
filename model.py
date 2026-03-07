@@ -1,56 +1,94 @@
-import torch, torch.nn as nn
-import torch.nn.functional as F
 
-class FrozenMAEEncoder(nn.Module):
-    def __init__(self, vit):
+import torch
+import torch.nn as nn
+import timm
+
+class ConvDecoder(nn.Module):
+    def __init__(self, embed_dim=768, num_classes=1):
         super().__init__()
-        self.vit = vit
-
-    @torch.no_grad()
-    def forward(self, x):
-        tokens = self.vit.forward_features(x)  # [B, N+1, C]
-        if tokens.ndim != 3:
-            raise RuntimeError(f"Expected token tensor [B,N,C], got {tokens.shape}.")
-        patch = tokens[:, 1:, :]
-        B, N, C = patch.shape
-        h = w = int(N ** 0.5)
-        if h * w != N:
-            raise RuntimeError(f"Patch tokens N={N} is not a square; check input size/patch size.")
-        feat = patch.transpose(1, 2).reshape(B, C, h, w)
-        return feat
-
-
-class SimpleUpsampleDecoder(nn.Module):
-    def __init__(self, in_ch: int = 768, out_size: int = 224, patch: int = 16, mid_ch: int = 256):
-        super().__init__()
-        assert out_size % patch == 0, "out_size must be divisible by patch size."
-
-        def gn(c):
-            g = 32
-            while c % g != 0 and g > 1:
-                g //= 2
-            return nn.GroupNorm(g, c)
-
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_ch, mid_ch, 3, padding=1, bias=False),
-            gn(mid_ch),
-            nn.GELU(),
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, 256, kernel_size=2, stride=2),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, kernel_size=3, padding=1)
         )
 
-        steps = int(round(torch.log2(torch.tensor(patch)).item()))  # patch=16 -> 4
-        self.blocks = nn.ModuleList()
-        for _ in range(steps):
-            self.blocks.append(nn.Sequential(
-                nn.Conv2d(mid_ch, mid_ch, 3, padding=1, bias=False),
-                gn(mid_ch),
-                nn.GELU(),
-            ))
+    def forward(self, x):
+        return self.upsample(x)
 
-        self.head = nn.Conv2d(mid_ch, 1, kernel_size=1)
+class MAESegmenter(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        # 关键修改：in_chans=3 (DWI, ADC, DWI-ADC)
+        self.encoder = timm.create_model('vit_base_patch16_224', pretrained=True, in_chans=3, global_pool='')
+        self.decoder = ConvDecoder(embed_dim=768, num_classes=num_classes)
 
-    def forward(self, feat):
-        x = self.proj(feat)
-        for blk in self.blocks:
-            x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-            x = blk(x)
-        return self.head(x)
+    def forward(self, x):
+        features = self.encoder.forward_features(x)
+        features = features[:, 1:, :] # 移除 CLS token
+        B, N, C = features.shape
+        H = W = int(N**0.5) 
+        features = features.transpose(1, 2).reshape(B, C, H, W)
+        return self.decoder(features)
+
+class SimpleMLPClassifier(nn.Module):
+    def __init__(self, input_dim=3*224*224, hidden_dims=None, num_classes=1, dropout=0.0):
+        super().__init__()
+        hidden_dims = hidden_dims or [512, 256]
+        layers = []
+        in_dim = input_dim
+        
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.ELU())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = h_dim
+            
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # Flatten only when we receive image-like tensors
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        return self.mlp(x)
+
+
+class FrozenViTEncoder(nn.Module):
+    def __init__(self, model_name='vit_base_patch16_224', in_chans=3):
+        super().__init__()
+        self.encoder = timm.create_model(model_name, pretrained=True, in_chans=in_chans, global_pool='')
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.embed_dim = getattr(self.encoder, "num_features", getattr(self.encoder, "embed_dim", 768))
+        self.encoder.eval()
+
+    def forward(self, x):
+        # Keep encoder frozen and in eval mode for deterministic latents
+        self.encoder.eval()
+        with torch.no_grad():
+            features = self.encoder.forward_features(x)
+        cls_token = features[:, 0]
+        return cls_token
+
+
+class FrozenViTMLPClassifier(nn.Module):
+    def __init__(self, hidden_dims=None, num_classes=1, dropout=0.1, model_name='vit_base_patch16_224', in_chans=3):
+        super().__init__()
+        self.encoder = FrozenViTEncoder(model_name=model_name, in_chans=in_chans)
+        self.classifier = SimpleMLPClassifier(
+            input_dim=self.encoder.embed_dim,
+            hidden_dims=hidden_dims,
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+
+    def forward(self, x):
+        latents = self.encoder(x)
+        return self.classifier(latents)
