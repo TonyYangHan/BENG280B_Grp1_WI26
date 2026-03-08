@@ -47,3 +47,24 @@ These scripts generate the high-quality figures and interactive 3D plots feature
 Ensure you have the required libraries installed in your conda environment:
 ```bash
 pip install torch numpy matplotlib plotly scikit-image opencv-python torchvision
+```
+
+### Execution
+**Important Note:** Before running any visualization script, please ensure you update the file paths at the top of each `.py` file to match your local environment:
+* `DATA_ROOT`: Directory containing the preprocessed `.npz` files.
+* `CKPT_PATH`: Path to the trained model weights (`.pth` file).
+
+Then, simply run the desired script via python:
+
+```bash
+# Example: Generate interactive 3D Meshes
+python vis_3d_mesh_v2.py
+
+# Example: Generate 2D Noise Robustness matrices
+python vis_noise_comparison_v2.py
+```
+
+Output files (images and `.html` files) will be automatically saved in their respective generated folders (e.g., `vis_3d_mesh_results_labeled`, `vis_noise_robustness2`).
+
+---
+*Developed for BENG 280B (Winter 2026) at UC San Diego.*
