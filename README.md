@@ -12,7 +12,15 @@ This branch (`Tinger's-branch`) houses the finalized core model architecture alo
 * **`model.py`**: Contains the core architecture, including the pre-trained ViT-Base encoder and our custom Convolutional Decoder.
 * **`data.py`**: Handles the loading and preprocessing of the ISLES 2022 multi-modal DWI/ADC dataset.
 
-### 2. Visualization Suite
+### 2. Unet Baseline & Generalization Folders
+* 🏗️ **`Unet/` (Baseline Model)**
+  * **Purpose**: Provides the standard U-Net architecture for stroke lesion segmentation.
+  * **Function**: Used to establish baseline performance metrics and generate comparison results against our proposed SSL (ViT-Base) approach.
+* 🌍 **`generalization/` (PI-CAI Dataset)**
+  * **Purpose**: Tests the generalization capability of our SSL model on a completely different medical imaging domain.
+  * **Function**: Generates code and adapts a new decoder designed specifically to train and evaluate on the PI-CAI (Prostate Cancer) dataset.
+
+### 3. Visualization Folder 
 These scripts generate the high-quality figures and interactive 3D plots featured in our final presentation slides.
 
 * 📊 **`vis_patient_full.py` (2D Clean Data)**
