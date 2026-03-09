@@ -1,8 +1,8 @@
 # 🧠 BENG 280B Group 1: Few-Shot Stroke Lesion Segmentation
-
+**Group members: Yang Han, Tinger Shi, Jason Chiu, Terence (Xinyuan) Luo** <br>
 Welcome to the visualization and evaluation suite for the BENG 280B Winter 2026 project: **"Few-shot segmentation of 2D DWI images with Self-Supervised Learning (SSL)"**. 
 
-This branch (`Tinger's-branch`) houses the finalized core model architecture alongside a comprehensive set of 2D and 3D visualization scripts. These tools were specifically developed to assess the spatial accuracy and noise robustness of our SSL (ViT-Base) model.
+This repo houses the finalized core model architecture that uses a self-supervised pretrained encoder (ViT-Base) to extract ischemic stroke lesion features in DWI scans and a trained convolutional decoder that segments the lesions. It also contains a comprehensive set of 2D and 3D visualization scripts. These tools were specifically developed to assess the spatial accuracy and noise robustness of our model.
 
 ---
 
@@ -11,6 +11,14 @@ This branch (`Tinger's-branch`) houses the finalized core model architecture alo
 ### 1. Core Model
 * **`model.py`**: Contains the core architecture, including the pre-trained ViT-Base encoder and our custom Convolutional Decoder.
 * **`data.py`**: Handles the loading and preprocessing of the ISLES 2022 multi-modal DWI/ADC dataset.
+* **`train.py`**: The main file that trains the self-supervised segmentation framework.
+* **`utils.py`**: Contains helper functions
+* **`loss.py`**: Implements the loss functions used in model training
+* **`data.py`**: Handles the loading and preprocessing of the ISLES 2022 multi-modal DWI/ADC dataset.
+* **`cross_val.py`**: Conducts 5-fold cross validation for the model
+
+
+
 
 ### 2. Unet Baseline & Generalization Folders
 * 🏗️ **`Unet/` (Baseline Model)**
