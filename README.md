@@ -12,7 +12,7 @@ This branch (`Tinger's-branch`) houses the finalized core model architecture alo
 * **`model.py`**: Contains the core architecture, including the pre-trained ViT-Base encoder and our custom Convolutional Decoder.
 * **`data.py`**: Handles the loading and preprocessing of the ISLES 2022 multi-modal DWI/ADC dataset.
 
-### 2. Visualization Suite (For Final Presentation)
+### 2. Visualization Suite
 These scripts generate the high-quality figures and interactive 3D plots featured in our final presentation slides.
 
 * 📊 **`vis_patient_full.py` (2D Clean Data)**
